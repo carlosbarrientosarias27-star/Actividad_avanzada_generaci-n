@@ -6,44 +6,36 @@ from unittest.mock import patch
 class RateLimiter:
     def __init__(self, max_requests: int = 100, window: int = 60):
         self.max_requests = max_requests
-        # Tasa de regeneración: tokens por segundo
         self.refill_rate = max_requests / window  
         self.expiry_duration = 60
-        
-        # Diccionario para almacenar el estado de cada IP
-        # {ip: {"tokens": float, "last_refill": float, "last_access": float}}
         self.buckets = {}
         self.lock = threading.Lock()
-
-    def _refill(self, ip: str, current_time: float):
-        """Calcula y añade tokens basados en el tiempo transcurrido (O(1))."""
-        bucket = self.buckets[ip]
-        elapsed = current_time - bucket["last_refill"]
         
-        # Algoritmo Token Bucket Puro
-        new_tokens = elapsed * self.refill_rate
-        bucket["tokens"] = min(self.max_requests, bucket["tokens"] + new_tokens)
-        bucket["last_refill"] = current_time
+        # Hilo de fondo para producción
+        self.cleanup_thread = threading.Thread(target=self._run_periodic_cleanup, daemon=True)
+        self.cleanup_thread.start()
 
-    def _cleanup(self, current_time: float):
-        """Elimina IPs inactivas por más de 60s para liberar memoria (O(1) amortizado)."""
-        # Nota: En Python, iterar y borrar requiere una lista intermedia de llaves
-        expired_ips = [
-            ip for ip, data in self.buckets.items() 
-            if current_time - data["last_access"] > self.expiry_duration
-        ]
-        for ip in expired_ips:
-            del self.buckets[ip]
+    def _run_periodic_cleanup(self):
+        """Loop infinito para el hilo de fondo."""
+        while True:
+            time.sleep(self.expiry_duration)
+            self.run_cleanup(time.time())
+
+    def run_cleanup(self, current_time: float):
+        """Lógica de limpieza expuesta para ser testeable (O(n) controlado)."""
+        with self.lock:
+            expired_ips = [
+                ip for ip, data in self.buckets.items() 
+                if current_time - data["last_access"] > self.expiry_duration
+            ]
+            for ip in expired_ips:
+                del self.buckets[ip]
 
     def is_allowed(self, ip: str) -> bool:
-        """Determina si una IP tiene tokens disponibles para la petición."""
         now = time.time()
-        
         with self.lock:
-            # 1. Limpieza de IPs obsoletas
-            self._cleanup(now)
-            
-            # 2. Inicialización si la IP es nueva
+            # OPTIMIZACIÓN: Ya no llamamos a la limpieza aquí.
+            # Esto hace que la validación sea O(1).
             if ip not in self.buckets:
                 self.buckets[ip] = {
                     "tokens": float(self.max_requests),
@@ -51,11 +43,44 @@ class RateLimiter:
                     "last_access": now
                 }
             
-            # 3. Recarga perezosa de tokens
             self._refill(ip, now)
             self.buckets[ip]["last_access"] = now
             
-            # 4. Consumo de token
+            if self.buckets[ip]["tokens"] >= 1:
+                self.buckets[ip]["tokens"] -= 1
+                return True
+            return False
+
+    def _refill(self, ip: str, current_time: float):
+        bucket = self.buckets[ip]
+        elapsed = current_time - bucket["last_refill"]
+        new_tokens = elapsed * self.refill_rate
+        bucket["tokens"] = min(self.max_requests, bucket["tokens"] + new_tokens)
+        bucket["last_refill"] = current_time
+
+    def is_allowed(self, ip: str) -> bool:
+        """
+        Determina si una IP tiene tokens disponibles (O(1)).
+        
+        Args:
+            ip (str): La dirección IP del cliente.
+        Returns:
+            bool: True si la petición es permitida, False en caso contrario.
+        """
+        now = time.time()
+        # ... resto del código con su indentación correcta ...
+        with self.lock:
+            # OPTIMIZACIÓN: Ya no llamamos a _cleanup aquí. Complejidad O(1).
+            if ip not in self.buckets:
+                self.buckets[ip] = {
+                    "tokens": float(self.max_requests),
+                    "last_refill": now,
+                    "last_access": now
+                }
+            
+            self._refill(ip, now)
+            self.buckets[ip]["last_access"] = now
+            
             if self.buckets[ip]["tokens"] >= 1:
                 self.buckets[ip]["tokens"] -= 1
                 return True
@@ -84,14 +109,15 @@ class TestRateLimiter(unittest.TestCase):
 
     @patch('time.time')
     def test_ip_expirada_se_resetea(self, mock_time):
-        """Caso (c): IP sin actividad > 60s se elimina del sistema."""
+        """Caso (c): Ahora invocamos run_cleanup con el tiempo simulado."""
         mock_time.return_value = 1000.0
         self.limiter.is_allowed("1.1.1.1")
         
-        # Avanzar 61 segundos
+        # Avanzar 61 segundos en el simulador
         mock_time.return_value = 1061.0
-        # Forzar un ciclo de cleanup con otra IP
-        self.limiter.is_allowed("2.2.2.2")
+        
+        # Forzamos la limpieza usando el tiempo del mock
+        self.limiter.run_cleanup(1061.0)
         
         self.assertNotIn("1.1.1.1", self.limiter.buckets)
 
