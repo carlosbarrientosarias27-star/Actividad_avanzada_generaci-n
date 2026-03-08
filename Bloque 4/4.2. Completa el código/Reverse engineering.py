@@ -1,56 +1,87 @@
 from datetime import datetime
+from collections import defaultdict
 
-def analyze_spending(transactions, month, year):
-    # 1. Configuración inicial
-    EXCHANGE_RATES = {
-        "USD": 0.92,  # 1 USD = 0.92 EUR
-        "EUR": 1.0,   # Base
-        "GBP": 1.17   # 1 GBP = 1.17 EUR
-    }
-    
-    # Estructura por defecto para cuando no hay datos
-    empty_result = {
-        "category": {},
-        "total_spend": 0.0,
-        "transaction_count": 0,
-        "months_without_data": True
-    }
+EXCHANGE_RATES = {
+    "USD": 1.0,
+    "EUR": 1.09,   # 1 EUR = 1.09 USD
+    "GBP": 1.27,
+    "JPY": 0.0067,
+    "MXN": 0.058,
+    "BRL": 0.20,
+    "CAD": 0.74,
+    "ARS": 0.0011,
+}
 
-    category_totals = {}
-    grand_total = 0.0
-    count = 0
+BASE_CURRENCY = "USD"
 
-    # 2. Filtrado y Procesamiento
-    for tx in transactions:
-        # Asumiendo que tx['timestamp'] es un objeto datetime o un string ISO
-        ts = tx['timestamp']
-        if isinstance(ts, str):
-            ts = datetime.fromisoformat(ts)
 
-        # (1) Filtrar por mes y año
-        if ts.month == month and ts.year == year:
-            # (2) Conversión de moneda
-            amount = tx['amount']
-            currency = tx.get('currency', 'EUR')
-            rate = EXCHANGE_RATES.get(currency, 1.0)
-            
-            amount_in_base = amount * rate
-            
-            # (3) Agrupar por categoría
-            cat = tx['category']
-            category_totals[cat] = category_totals.get(cat, 0.0) + amount_in_base
-            
-            grand_total += amount_in_base
-            count += 1
+def analyze_spending(
+    transactions: list[dict],
+    month: int,
+    year: int,
+    base_currency: str = BASE_CURRENCY,
+) -> dict:
+    """
+    Analyze spending for a given month/year.
 
-    # (5) Si no hay transacciones, devolver estructura vacía
-    if count == 0:
-        return empty_result
+    Each transaction is expected to have:
+      - timestamp: datetime | str (ISO 8601)
+      - amount: float
+      - currency: str  (e.g. "EUR", "USD")
+      - category: str
 
-    # (4) Devolver dict con valores redondeados
+    Returns:
+      {
+        "categories": {category: total, ...},
+        "total_spend": float,
+        "transaction_count": int,
+        "months_without_data": bool,
+      }
+    """
+
+    def _to_base(amount: float, currency: str) -> float:
+        """Convert amount to base currency via hardcoded rates."""
+        rate_from = EXCHANGE_RATES.get(currency.upper(), 1.0)
+        rate_to = EXCHANGE_RATES.get(base_currency.upper(), 1.0)
+        return amount * (rate_from / rate_to)
+
+    def _parse_ts(ts) -> datetime:
+        if isinstance(ts, datetime):
+            return ts
+        return datetime.fromisoformat(str(ts))
+
+    # (1) Filter by month and year
+    filtered = [
+        t for t in transactions
+        if _parse_ts(t["timestamp"]).month == month
+        and _parse_ts(t["timestamp"]).year == year
+    ]
+
+    # (5) No transactions → return empty structure without raising
+    if not filtered:
+        return {
+            "categories": {},
+            "total_spend": 0.0,
+            "transaction_count": 0,
+            "months_without_data": True,
+        }
+
+    # (2 & 3) Convert to base currency and group by category
+    category_totals: dict[str, float] = defaultdict(float)
+
+    for t in filtered:
+        converted = _to_base(t["amount"], t.get("currency", base_currency))
+        category_totals[t["category"]] += converted
+
+    # (3) Round each category total to 2 decimals
+    categories = {cat: round(total, 2) for cat, total in category_totals.items()}
+
+    # (4) Build and return result dict
+    total_spend = round(sum(categories.values()), 2)
+
     return {
-        "category": {k: round(v, 2) for k, v in category_totals.items()},
-        "total_spend": round(grand_total, 2),
-        "transaction_count": count,
-        "months_without_data": False
+        "categories": categories,
+        "total_spend": total_spend,
+        "transaction_count": len(filtered),
+        "months_without_data": False,
     }
